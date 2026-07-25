@@ -47,37 +47,7 @@ Sample audio files for testing are in [`audio_files/`](audio_files/).
 
 ## Pipeline flow
 
-```mermaid
-flowchart TD
-    A[Audio file] --> B["accept_audio.py<br/>ffprobe validation"]
-    B -- invalid --> X["Rejected: not found / empty /<br/>not audio / video stream"]
-    B -- valid --> C{"duration ≤ MIN_CHUNK_SECONDS?"}
-
-    C -- yes, short file --> D["Single pass<br/>_run_model()"]
-    D --> N
-
-    C -- no, long file --> E["Silence detection<br/>ffmpeg silencedetect (one fast pass)"]
-    E --> F["Split into chunks<br/>boundaries snapped to silence<br/>+ check cache for already-done chunks"]
-    F --> G{"GPU available?"}
-    G -- yes --> H["Pool(workers = 1)<br/>one process, model loaded once"]
-    G -- no --> I["Pool(workers = N)<br/>N ≈ half the CPU cores, minus one"]
-
-    H --> J["_transcribe_chunk per chunk"]
-    I --> J
-    J --> J1{"cached already?"}
-    J1 -- yes --> J3["load saved result"]
-    J1 -- no --> J2["transcribe chunk<br/>(retry up to CHUNK_RETRIES)"]
-    J2 -- success --> J4["save result to disk cache"]
-    J2 -- still fails --> J5["mark chunk failed<br/>(not cached — stays retryable)"]
-
-    J3 --> K
-    J4 --> K
-    J5 --> K["Merge all chunks<br/>midpoint ownership + timestamp offset"]
-    K --> N["Output"]
-
-    N --> O["transcribe.py<br/>plain text"]
-    N --> P["transcribe_with_timestamps.py<br/>JSON with HH:MM:SS segments"]
-```
+![Transcription pipeline flow](assets/pipeline.png)
 
 If any chunk failed, the cache directory is left on disk and a rerun of the same file skips every chunk that already succeeded, retrying only what's missing (see "Resilience" below). On full success, the cache is cleared.
 
