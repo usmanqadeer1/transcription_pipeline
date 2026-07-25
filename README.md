@@ -47,7 +47,8 @@ Sample audio files for testing are in [`audio_files/`](audio_files/).
 
 ## Pipeline flow
 
-![Transcription pipeline flow](assets/pipeline.png)
+<img src="assets/pipeline.png" alt="Transcription pipeline flow" width="480">
+
 
 If any chunk failed, the cache directory is left on disk and a rerun of the same file skips every chunk that already succeeded, retrying only what's missing (see "Resilience" below). On full success, the cache is cleared.
 
