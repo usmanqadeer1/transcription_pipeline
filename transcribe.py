@@ -135,23 +135,8 @@ def _snap_to_silence(boundary: float, silence_midpoints: list, max_shift: float)
 
 def _split_into_chunks(path: str, duration: float, chunk_length: float, tmp_dir: str, cache_dir: str):
     """Cut a long file into overlapping chunks so they can be transcribed by
-    the worker pool (parallel on CPU, sequential on GPU — see module docstring).
+    the worker pool (parallel on CPU, sequential on GPU).
 
-    chunk_length is chosen by the caller based on how many workers there are,
-    not a fixed constant — this splits the audio into roughly one chunk per
-    worker.
-
-    Interior cut points are snapped to nearby silence (searching up to
-    SNAP_SEARCH_SECONDS away) so they land between sentences rather than
-    through one. Each chunk then only needs a small READ_PAD_SECONDS margin
-    on either side of its nominal [nominal_start, nominal_end) window, since
-    the cut itself already sits in near-silence (clamped at the file's
-    edges). Returns a list of (read_start, nominal_start, nominal_end,
-    chunk_path, cache_file).
-
-    If a chunk's cache_file already exists (from a previous, possibly crashed
-    run of this same file), the ffmpeg cut is skipped entirely for that chunk —
-    _transcribe_chunk will load the saved result instead of re-doing any work.
     """
     silence_midpoints = _find_silence_midpoints(path)
     raw_cuts = range(int(chunk_length), max(int(duration), 1), int(chunk_length))
@@ -189,22 +174,6 @@ def _transcribe_chunk(chunk: tuple) -> dict:
     point from being emitted twice: both neighboring chunks hear it (thanks
     to the overlap), but only the one whose window contains its midpoint
     keeps it.
-
-    Because boundaries are snapped to silence first, a cut landing mid-sentence
-    should be rare. It can still happen if no silence gap exists near a
-    boundary (continuous speech for longer than one chunk) — a residual
-    limitation of any fixed-size chunking scheme.
-
-    Two robustness details for long files:
-      - cache hit: if chunk_path is None, this chunk was already transcribed
-        in a previous run — its result is loaded from cache_file instead of
-        running the model again.
-      - retry + fault isolation: a fresh chunk is retried up to CHUNK_RETRIES
-        times before being marked "failed" instead of raising — one bad chunk
-        (e.g. a transient OOM) shouldn't discard every other chunk's work.
-
-    Uses the module-level _worker_model, loaded once per worker process by
-    _init_worker() — not reloaded on every call.
     """
     read_start, nominal_start, nominal_end, chunk_path, cache_file = chunk
 
@@ -254,33 +223,13 @@ def transcribe(path: str) -> str:
         return " ".join(s["text"] for s in segments)
 
     if _has_gpu():
-        # One GPU, one worker — see module docstring for why this isn't
-        # parallelized the way the CPU path is.
+        # One GPU, one worker
         workers = 1
     else:
-        # Cap workers at ~physical cores minus one, not raw logical cpu_count():
-        # whisper inference is CPU-bound native code, so hyperthreads buy little
-        # extra throughput while doubling memory (each worker loads its own copy
-        # of the model), and leaving one core free keeps the OS/ffmpeg responsive.
-        # cpu_count() // 2 approximates physical cores (correct for the common
-        # 2-way-hyperthreading case; a rough estimate otherwise). For long audio
-        # this cap is what ends up binding — there's no upper limit on chunk
-        # count worth raising it toward, since more workers than this just adds
-        # contention rather than throughput.
         auto_cap = max(1, cpu_count() // 2 - 1)
         workers = min(auto_cap, max(1, int(duration // MIN_CHUNK_SECONDS)))
-        # Deliberately NOT short-circuiting to a plain single pass when this
-        # resolves to 1 worker (e.g. a CPU-constrained machine): the file is
-        # already past MIN_CHUNK_SECONDS, so it's long enough that resumable
-        # chunking is still worth it even without any parallelism gain — the
-        # same reasoning as the GPU case above.
 
-    # Chunk COUNT is not the same thing as worker count: workers controls
-    # parallelism, but even a single worker (GPU) should still get many
-    # small checkpointed chunks on a long file, not one giant chunk covering
-    # the whole thing (which would give zero resumability benefit). So the
-    # chunk count is at least `workers`, but grows with duration independent
-    # of it.
+
     num_chunks = max(workers, int(duration // MIN_CHUNK_SECONDS))
     chunk_length = duration / num_chunks
     cache_dir = _cache_dir_for(path)

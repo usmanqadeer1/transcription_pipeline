@@ -57,14 +57,7 @@ def transcribe_with_timestamps(path: str) -> dict:
     else:
         auto_cap = max(1, cpu_count() // 2 - 1)
         workers = min(auto_cap, max(1, int(duration // MIN_CHUNK_SECONDS)))
-        # Not short-circuiting when this resolves to 1 worker — see
-        # transcribe.transcribe() for why: the file is already long enough
-        # (past MIN_CHUNK_SECONDS) that resumable chunking is worth it even
-        # without a parallelism gain.
 
-    # Chunk COUNT is not the same as worker count — see transcribe.transcribe()
-    # for why: even one worker (GPU) should get many checkpointed chunks on a
-    # long file, not one giant chunk with no resumability benefit.
     num_chunks = max(workers, int(duration // MIN_CHUNK_SECONDS))
     chunk_length = duration / num_chunks
     cache_dir = _cache_dir_for(path)
