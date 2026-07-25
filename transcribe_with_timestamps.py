@@ -17,7 +17,10 @@ import time
 from multiprocessing import Pool, cpu_count
 
 from accept_audio import accept_audio
-from transcribe import _run_model, _split_into_chunks, _transcribe_chunk, _has_gpu, MIN_CHUNK_SECONDS
+from transcribe import (
+    _run_model, _split_into_chunks, _transcribe_chunk, _init_worker,
+    _has_gpu, _cache_dir_for, MIN_CHUNK_SECONDS,
+)
 
 
 def _format_timestamp(seconds: float) -> str:
@@ -30,7 +33,7 @@ def _format_timestamp(seconds: float) -> str:
 
 def _format_segments(segments: list) -> list:
     """Convert raw-seconds start/end (as produced by _run_model/_transcribe_chunk)
-    into HH:MM:SS,mmm strings for the final output."""
+    into HH:MM:SS strings for the final output."""
     return [
         {"start": _format_timestamp(s["start"]), "end": _format_timestamp(s["end"]), "text": s["text"]}
         for s in segments
@@ -38,44 +41,62 @@ def _format_segments(segments: list) -> list:
 
 
 def transcribe_with_timestamps(path: str) -> dict:
-    """Validate the audio, transcribe it (in parallel if long), and return
+    """Validate the audio, transcribe it (chunked if long), and return
     segments with timestamps. See transcribe.transcribe() for the worker
     selection and chunking logic this reuses."""
     info = accept_audio(path)
     duration = info["duration_sec"]
 
-    if _has_gpu():
-        # CPU-process parallelism doesn't translate to a single GPU — see
-        # transcribe.py's module docstring. Run the whole file in one pass.
-        print(f"GPU detected — transcribing {duration:.1f}s of audio in a single pass...",
-              file=sys.stderr)
-        language, segments = _run_model(path)
-        return {"language": language, "segments": _format_segments(segments)}
-
-    auto_cap = max(1, cpu_count() // 2 - 1)
-    workers = min(auto_cap, max(1, int(duration // MIN_CHUNK_SECONDS)))
-
-    if workers <= 1:
+    if duration <= MIN_CHUNK_SECONDS:
         print(f"Transcribing {duration:.1f}s of audio...", file=sys.stderr)
         language, segments = _run_model(path)
         return {"language": language, "segments": _format_segments(segments)}
 
-    chunk_length = duration / workers
+    if _has_gpu():
+        workers = 1
+    else:
+        auto_cap = max(1, cpu_count() // 2 - 1)
+        workers = min(auto_cap, max(1, int(duration // MIN_CHUNK_SECONDS)))
+        # Not short-circuiting when this resolves to 1 worker — see
+        # transcribe.transcribe() for why: the file is already long enough
+        # (past MIN_CHUNK_SECONDS) that resumable chunking is worth it even
+        # without a parallelism gain.
+
+    # Chunk COUNT is not the same as worker count — see transcribe.transcribe()
+    # for why: even one worker (GPU) should get many checkpointed chunks on a
+    # long file, not one giant chunk with no resumability benefit.
+    num_chunks = max(workers, int(duration // MIN_CHUNK_SECONDS))
+    chunk_length = duration / num_chunks
+    cache_dir = _cache_dir_for(path)
     tmp_dir = tempfile.mkdtemp(prefix="transcribe_chunks_")
     try:
-        chunks = _split_into_chunks(path, duration, chunk_length, tmp_dir)
+        chunks = _split_into_chunks(path, duration, chunk_length, tmp_dir, cache_dir)
         workers = min(workers, len(chunks))
-        print(f"Transcribing {duration:.1f}s of audio across {len(chunks)} chunks "
-              f"using {workers} worker process(es) ({cpu_count()} CPU cores available)...",
+        mode = "1 GPU worker, model loaded once" if _has_gpu() else \
+            f"{workers} CPU worker process(es) ({cpu_count()} cores available)"
+        print(f"Transcribing {duration:.1f}s of audio across {len(chunks)} chunks using {mode}...",
               file=sys.stderr)
 
         language = None
         all_segments = []
-        with Pool(workers) as pool:
+        failed_ranges = []
+        with Pool(workers, initializer=_init_worker) as pool:
             for i, result in enumerate(pool.imap(_transcribe_chunk, chunks), start=1):
-                print(f"  chunk {i}/{len(chunks)} done", file=sys.stderr)
-                language = language or result["language"]
+                if result.get("error"):
+                    failed_ranges.append((result["nominal_start"], result["nominal_end"], result["error"]))
+                    print(f"  chunk {i}/{len(chunks)} FAILED: {result['error']}", file=sys.stderr)
+                else:
+                    print(f"  chunk {i}/{len(chunks)} done", file=sys.stderr)
+                language = language or result.get("language")
                 all_segments.extend(result["segments"])
+
+        if failed_ranges:
+            for start_s, end_s, err in failed_ranges:
+                print(f"Warning: {start_s:.1f}s-{end_s:.1f}s failed and is missing "
+                      f"from the transcript ({err}). Rerun the same file to retry just this part.",
+                      file=sys.stderr)
+        else:
+            shutil.rmtree(cache_dir, ignore_errors=True)
 
         return {"language": language, "segments": _format_segments(all_segments)}
     finally:

@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
 transcribe.py — transcribes an audio file to plain text with faster-whisper.
-On CPU, long files are chunked and transcribed in parallel across processes.
-On GPU, chunking is skipped and the whole file goes through in one pass —
-multiple processes fighting over one GPU (and each loading its own copy of
-the model into VRAM) is not a speedup, so that strategy only applies to CPU.
+
+Long files are split into chunks and transcribed via multiprocessing.Pool.
+On CPU that pool has multiple workers running in parallel, for speed. On GPU
+it's Pool(1) — one process, one model — since multiple processes contending
+for a single GPU (each loading its own copy of the model into VRAM) isn't a
+speedup. Both cases are the same code path; GPU is just "the CPU path with
+exactly one worker," which is also how it's tested (see the test suite).
+Chunking either way also gives fault isolation and resumable caching: a
+failed chunk doesn't discard everything else, and a rerun of the same file
+skips chunks that already succeeded.
 
 Usage:
     python transcribe.py audio.wav
 """
 
 import argparse
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -26,6 +34,29 @@ MIN_CHUNK_SECONDS = 150           # never split into chunks shorter than this �
 SNAP_SEARCH_SECONDS = 10         # how far to look for a nearby silence gap when placing a cut
 READ_PAD_SECONDS = 1.0           # small safety margin on each chunk's audio read, so a sound
                                   # landing exactly on the cut sample isn't clipped
+CHUNK_RETRIES = 2                # attempts per chunk before it's marked failed instead of
+                                  # crashing the whole run
+
+_worker_model = None   # set once per worker process by _init_worker(), reused for every
+                        # chunk that worker processes
+
+
+def _cache_dir_for(path: str) -> str:
+    """A persistent, deterministic directory for this file's chunk results.
+
+    Keyed off the file's absolute path, size, and modified time, so re-running
+    the same file finds the same cache dir (and a different file, or an edited
+    one, gets a fresh one). This is what makes resuming after a crash possible:
+    each chunk's result is saved here as soon as it succeeds, so a rerun can
+    skip chunks that already finished instead of re-transcribing the whole
+    file from scratch.
+    """
+    stat = os.stat(path)
+    key_input = f"{os.path.abspath(path)}:{stat.st_size}:{int(stat.st_mtime)}"
+    key = hashlib.sha1(key_input.encode()).hexdigest()[:16]
+    cache_dir = os.path.join(tempfile.gettempdir(), "transcribe_cache", key)
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
 
 
 def _has_gpu() -> bool:
@@ -38,14 +69,30 @@ def _has_gpu() -> bool:
         return False
 
 
-def _run_model(path: str):
-    """Transcribe a single file/chunk in this process. Returns (language, segments)."""
+def _load_model():
+    """Load a whisper model, GPU or CPU depending on what's available."""
     from faster_whisper import WhisperModel
 
     if _has_gpu():
-        model = WhisperModel("base", device="cuda", compute_type="float16")
-    else:
-        model = WhisperModel("base", device="cpu", compute_type="int8")     # int8 = lighter, CPU-friendly
+        return WhisperModel("base", device="cuda", compute_type="float16")
+    return WhisperModel("base", device="cpu", compute_type="int8")     # int8 = lighter, CPU-friendly
+
+
+def _init_worker():
+    """multiprocessing.Pool initializer: runs once when a worker process
+    starts, before it's given any chunks. Loading the model here (into the
+    module-level _worker_model, so _transcribe_chunk can find it) means each
+    worker pays the ~5-6s model-load cost once for its whole lifetime, not
+    once per chunk it happens to be assigned."""
+    global _worker_model
+    _worker_model = _load_model()
+
+
+def _run_model(path: str, model=None):
+    """Transcribe a single file/chunk. Returns (language, segments).
+    If model is None, a fresh one is loaded just for this call."""
+    if model is None:
+        model = _load_model()
     segments, info = model.transcribe(path, vad_filter=True)  # vad_filter skips silence
     result = [{"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
                for s in segments]
@@ -86,19 +133,25 @@ def _snap_to_silence(boundary: float, silence_midpoints: list, max_shift: float)
     return min(nearby, key=lambda t: abs(t - boundary)) if nearby else boundary
 
 
-def _split_into_chunks(path: str, duration: float, chunk_length: float, tmp_dir: str):
-    """Cut a long file into overlapping chunks so they can be transcribed in parallel.
+def _split_into_chunks(path: str, duration: float, chunk_length: float, tmp_dir: str, cache_dir: str):
+    """Cut a long file into overlapping chunks so they can be transcribed by
+    the worker pool (parallel on CPU, sequential on GPU — see module docstring).
 
-    chunk_length is chosen by the caller based on how many CPU cores are
-    available (see transcribe()), not a fixed constant — this splits the
-    audio into roughly one chunk per worker.
+    chunk_length is chosen by the caller based on how many workers there are,
+    not a fixed constant — this splits the audio into roughly one chunk per
+    worker.
 
     Interior cut points are snapped to nearby silence (searching up to
     SNAP_SEARCH_SECONDS away) so they land between sentences rather than
     through one. Each chunk then only needs a small READ_PAD_SECONDS margin
     on either side of its nominal [nominal_start, nominal_end) window, since
     the cut itself already sits in near-silence (clamped at the file's
-    edges). Returns a list of (read_start, nominal_start, nominal_end, chunk_path).
+    edges). Returns a list of (read_start, nominal_start, nominal_end,
+    chunk_path, cache_file).
+
+    If a chunk's cache_file already exists (from a previous, possibly crashed
+    run of this same file), the ffmpeg cut is skipped entirely for that chunk —
+    _transcribe_chunk will load the saved result instead of re-doing any work.
     """
     silence_midpoints = _find_silence_midpoints(path)
     raw_cuts = range(int(chunk_length), max(int(duration), 1), int(chunk_length))
@@ -109,7 +162,13 @@ def _split_into_chunks(path: str, duration: float, chunk_length: float, tmp_dir:
 
     chunks = []
     for nominal_start, nominal_end in zip(boundaries, boundaries[1:]):
+        cache_file = os.path.join(cache_dir, f"chunk_{nominal_start:.2f}.json")
         read_start = max(nominal_start - READ_PAD_SECONDS, 0)
+
+        if os.path.exists(cache_file):
+            chunks.append((read_start, nominal_start, nominal_end, None, cache_file))
+            continue
+
         read_end = min(nominal_end + READ_PAD_SECONDS, duration)
         chunk_path = os.path.join(tmp_dir, f"chunk_{nominal_start:.2f}.wav")
         subprocess.run(
@@ -119,24 +178,55 @@ def _split_into_chunks(path: str, duration: float, chunk_length: float, tmp_dir:
              chunk_path],
             check=True,
         )
-        chunks.append((read_start, nominal_start, nominal_end, chunk_path))
+        chunks.append((read_start, nominal_start, nominal_end, chunk_path, cache_file))
     return chunks
 
 
 def _transcribe_chunk(chunk: tuple) -> dict:
-    """Worker entry point: transcribe one chunk and keep only the segments this
-    chunk "owns" — those whose midpoint falls inside its nominal (non-overlap)
-    window. This is what prevents a sentence near a cut point from being
-    emitted twice: both neighboring chunks hear it (thanks to the overlap),
-    but only the one whose window contains its midpoint keeps it.
+    """Pool worker entry point: transcribe one chunk and keep only the
+    segments this chunk "owns" — those whose midpoint falls inside its
+    nominal (non-overlap) window. This is what prevents a sentence near a cut
+    point from being emitted twice: both neighboring chunks hear it (thanks
+    to the overlap), but only the one whose window contains its midpoint
+    keeps it.
 
     Because boundaries are snapped to silence first, a cut landing mid-sentence
     should be rare. It can still happen if no silence gap exists near a
     boundary (continuous speech for longer than one chunk) — a residual
     limitation of any fixed-size chunking scheme.
+
+    Two robustness details for long files:
+      - cache hit: if chunk_path is None, this chunk was already transcribed
+        in a previous run — its result is loaded from cache_file instead of
+        running the model again.
+      - retry + fault isolation: a fresh chunk is retried up to CHUNK_RETRIES
+        times before being marked "failed" instead of raising — one bad chunk
+        (e.g. a transient OOM) shouldn't discard every other chunk's work.
+
+    Uses the module-level _worker_model, loaded once per worker process by
+    _init_worker() — not reloaded on every call.
     """
-    read_start, nominal_start, nominal_end, chunk_path = chunk
-    language, segments = _run_model(chunk_path)
+    read_start, nominal_start, nominal_end, chunk_path, cache_file = chunk
+
+    if chunk_path is None:
+        with open(cache_file) as f:
+            return json.load(f)
+
+    error = None
+    for attempt in range(1, CHUNK_RETRIES + 1):
+        try:
+            language, segments = _run_model(chunk_path, model=_worker_model)
+            error = None
+            break
+        except Exception as e:
+            error = str(e)
+
+    if error is not None:
+        # Deliberately NOT cached to disk: caching a failure would make it
+        # permanent — a rerun would keep loading the same "failed" result
+        # forever instead of getting a fresh chance to retry this chunk.
+        return {"language": None, "segments": [], "error": error,
+                "nominal_start": nominal_start, "nominal_end": nominal_end}
 
     kept = []
     for s in segments:
@@ -145,71 +235,99 @@ def _transcribe_chunk(chunk: tuple) -> dict:
         midpoint = (abs_start + abs_end) / 2
         if nominal_start <= midpoint < nominal_end:
             kept.append({"start": round(abs_start, 2), "end": round(abs_end, 2), "text": s["text"]})
-    return {"language": language, "segments": kept}
+    result = {"language": language, "segments": kept}
+
+    with open(cache_file, "w") as f:
+        json.dump(result, f)
+    return result
 
 
 def transcribe(path: str) -> str:
-    """Validate the audio, transcribe it (in parallel if long), and return the transcript text.
-    Worker count is always chosen automatically — see the cap below."""
+    """Validate the audio, transcribe it (chunked if long), and return the transcript text."""
     info = accept_audio(path)
     duration = info["duration_sec"]
 
-    if _has_gpu():
-        # See the module docstring: CPU-process parallelism doesn't translate
-        # to a single GPU, so just run the whole file through in one pass.
-        print(f"GPU detected — transcribing {duration:.1f}s of audio in a single pass...",
-              file=sys.stderr)
-        _, segments = _run_model(path)
-        return " ".join(s["text"] for s in segments)
-
-    # Cap workers at ~physical cores minus one, not raw logical cpu_count():
-    # whisper inference is CPU-bound native code, so hyperthreads buy little
-    # extra throughput while doubling memory (each worker loads its own copy
-    # of the model), and leaving one core free keeps the OS/ffmpeg responsive.
-    # cpu_count() // 2 approximates physical cores (correct for the common
-    # 2-way-hyperthreading case; a rough estimate otherwise). For long audio
-    # this cap is what ends up binding — there's no upper limit on chunk
-    # count worth raising it toward, since more workers than this just adds
-    # contention rather than throughput.
-    auto_cap = max(1, cpu_count() // 2 - 1)
-
-    # Never split into chunks shorter than MIN_CHUNK_SECONDS — for a short
-    # file that's 1 worker, i.e. the plain single-pass path below.
-    workers = min(auto_cap, max(1, int(duration // MIN_CHUNK_SECONDS)))
-
-    if workers <= 1:
+    if duration <= MIN_CHUNK_SECONDS:
+        # Too short to be worth chunking either way.
         print(f"Transcribing {duration:.1f}s of audio...", file=sys.stderr)
         _, segments = _run_model(path)
         return " ".join(s["text"] for s in segments)
 
-    chunk_length = duration / workers
+    if _has_gpu():
+        # One GPU, one worker — see module docstring for why this isn't
+        # parallelized the way the CPU path is.
+        workers = 1
+    else:
+        # Cap workers at ~physical cores minus one, not raw logical cpu_count():
+        # whisper inference is CPU-bound native code, so hyperthreads buy little
+        # extra throughput while doubling memory (each worker loads its own copy
+        # of the model), and leaving one core free keeps the OS/ffmpeg responsive.
+        # cpu_count() // 2 approximates physical cores (correct for the common
+        # 2-way-hyperthreading case; a rough estimate otherwise). For long audio
+        # this cap is what ends up binding — there's no upper limit on chunk
+        # count worth raising it toward, since more workers than this just adds
+        # contention rather than throughput.
+        auto_cap = max(1, cpu_count() // 2 - 1)
+        workers = min(auto_cap, max(1, int(duration // MIN_CHUNK_SECONDS)))
+        # Deliberately NOT short-circuiting to a plain single pass when this
+        # resolves to 1 worker (e.g. a CPU-constrained machine): the file is
+        # already past MIN_CHUNK_SECONDS, so it's long enough that resumable
+        # chunking is still worth it even without any parallelism gain — the
+        # same reasoning as the GPU case above.
+
+    # Chunk COUNT is not the same thing as worker count: workers controls
+    # parallelism, but even a single worker (GPU) should still get many
+    # small checkpointed chunks on a long file, not one giant chunk covering
+    # the whole thing (which would give zero resumability benefit). So the
+    # chunk count is at least `workers`, but grows with duration independent
+    # of it.
+    num_chunks = max(workers, int(duration // MIN_CHUNK_SECONDS))
+    chunk_length = duration / num_chunks
+    cache_dir = _cache_dir_for(path)
     tmp_dir = tempfile.mkdtemp(prefix="transcribe_chunks_")
     try:
-        # Timed separately from the parallel pool below: silence detection and
+        # Timed separately from the pool below: silence detection and
         # chunk-splitting both run serially, on a single core, before any
         # worker starts — so they don't get faster just because you added
         # more workers, and can end up dominating the total time on long files.
         prep_start = time.perf_counter()
-        chunks = _split_into_chunks(path, duration, chunk_length, tmp_dir)
+        chunks = _split_into_chunks(path, duration, chunk_length, tmp_dir, cache_dir)
         prep_elapsed = time.perf_counter() - prep_start
 
         # Snapping chunk boundaries to silence can occasionally merge two
         # planned chunks into one, so the actual chunk count may come in
         # slightly under the plan — never start more workers than chunks.
         workers = min(workers, len(chunks))
+        mode = "1 GPU worker, model loaded once" if _has_gpu() else \
+            f"{workers} CPU worker process(es) ({cpu_count()} cores available)"
         print(f"Prep (silence detection + splitting): {prep_elapsed:.1f}s", file=sys.stderr)
-        print(f"Transcribing {duration:.1f}s of audio across {len(chunks)} chunks "
-              f"using {workers} worker process(es) ({cpu_count()} CPU cores available)...",
+        print(f"Transcribing {duration:.1f}s of audio across {len(chunks)} chunks using {mode}...",
               file=sys.stderr)
 
         pool_start = time.perf_counter()
         all_segments = []
-        with Pool(workers) as pool:
+        failed_ranges = []
+        with Pool(workers, initializer=_init_worker) as pool:
             for i, result in enumerate(pool.imap(_transcribe_chunk, chunks), start=1):
-                print(f"  chunk {i}/{len(chunks)} done", file=sys.stderr)
+                if result.get("error"):
+                    failed_ranges.append((result["nominal_start"], result["nominal_end"], result["error"]))
+                    print(f"  chunk {i}/{len(chunks)} FAILED: {result['error']}", file=sys.stderr)
+                else:
+                    print(f"  chunk {i}/{len(chunks)} done", file=sys.stderr)
                 all_segments.extend(result["segments"])
         pool_elapsed = time.perf_counter() - pool_start
-        print(f"Parallel transcription: {pool_elapsed:.1f}s", file=sys.stderr)
+        print(f"Transcription (pool): {pool_elapsed:.1f}s", file=sys.stderr)
+
+        if failed_ranges:
+            # Leave cache_dir in place on failure: the successful chunks are
+            # saved, so rerunning this same file only retries what failed
+            # instead of starting over from scratch.
+            for start_s, end_s, err in failed_ranges:
+                print(f"Warning: {start_s:.1f}s-{end_s:.1f}s failed and is missing "
+                      f"from the transcript ({err}). Rerun the same file to retry just this part.",
+                      file=sys.stderr)
+        else:
+            shutil.rmtree(cache_dir, ignore_errors=True)
 
         return " ".join(s["text"] for s in all_segments)
     finally:
