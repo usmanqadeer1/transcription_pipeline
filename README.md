@@ -115,7 +115,3 @@ Failed chunks are never written to that cache. If they were, a rerun would just 
 ### Keeping timestamps correct across chunks
 
 Each chunk is cut out as its own audio file, so when Whisper transcribes it, it has no idea where that chunk sits in the original recording, its timestamps always start at zero. Before merging results, I add back `read_start`, the chunk's actual position in the original file, to every segment's start and end. That's what keeps the final transcript on one continuous, correct timeline even though it was assembled from pieces transcribed separately.
-
-### What I left out
-
-Speaker diarization, cleaning up the transcript with an LLM, and running this as an async job behind an API are all things I'd add for a real production service, but they're outside what this exercise asked for. The async job piece matters most once you're handling multiple uploads at the same time, which is covered in the system design notes rather than the code here.
