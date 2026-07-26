@@ -211,16 +211,26 @@ def _transcribe_chunk(chunk: tuple) -> dict:
     return result
 
 
-def transcribe(path: str) -> str:
-    """Validate the audio, transcribe it (chunked if long), and return the transcript text."""
+def transcribe_segments(path: str) -> dict:
+    """Validate the audio, transcribe it (chunked if long), and return
+    {"language": ..., "segments": [{"start": float, "end": float, "text": ...}]}
+    with raw (unformatted) second-based timestamps.
+
+    This is the single shared implementation of the whole pipeline — worker
+    selection, chunking, the Pool loop, fault isolation, resumable caching.
+    transcribe() below just joins the segments into one string; anything
+    that wants timestamps (see transcribe_with_timestamps.py) calls this
+    directly and formats the segments itself, instead of duplicating any of
+    this orchestration.
+    """
     info = accept_audio(path)
     duration = info["duration_sec"]
 
     if duration <= MIN_CHUNK_SECONDS:
         # Too short to be worth chunking either way.
         print(f"Transcribing {duration:.1f}s of audio...", file=sys.stderr)
-        _, segments = _run_model(path)
-        return " ".join(s["text"] for s in segments)
+        language, segments = _run_model(path)
+        return {"language": language, "segments": segments}
 
     if _has_gpu():
         # One GPU, one worker
@@ -228,7 +238,6 @@ def transcribe(path: str) -> str:
     else:
         auto_cap = max(1, cpu_count() // 2 - 1)
         workers = min(auto_cap, max(1, int(duration // MIN_CHUNK_SECONDS)))
-
 
     num_chunks = max(workers, int(duration // MIN_CHUNK_SECONDS))
     chunk_length = duration / num_chunks
@@ -254,6 +263,7 @@ def transcribe(path: str) -> str:
               file=sys.stderr)
 
         pool_start = time.perf_counter()
+        language = None
         all_segments = []
         failed_ranges = []
         with Pool(workers, initializer=_init_worker) as pool:
@@ -263,6 +273,7 @@ def transcribe(path: str) -> str:
                     print(f"  chunk {i}/{len(chunks)} FAILED: {result['error']}", file=sys.stderr)
                 else:
                     print(f"  chunk {i}/{len(chunks)} done", file=sys.stderr)
+                language = language or result.get("language")
                 all_segments.extend(result["segments"])
         pool_elapsed = time.perf_counter() - pool_start
         print(f"Transcription (pool): {pool_elapsed:.1f}s", file=sys.stderr)
@@ -278,9 +289,15 @@ def transcribe(path: str) -> str:
         else:
             shutil.rmtree(cache_dir, ignore_errors=True)
 
-        return " ".join(s["text"] for s in all_segments)
+        return {"language": language, "segments": all_segments}
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def transcribe(path: str) -> str:
+    """Validate the audio, transcribe it (chunked if long), and return the transcript text."""
+    result = transcribe_segments(path)
+    return " ".join(s["text"] for s in result["segments"])
 
 
 def main():
