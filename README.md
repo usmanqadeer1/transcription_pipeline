@@ -1,30 +1,26 @@
 # Audio Transcription Pipeline
 
-A simple, script-based pipeline that validates an audio file, transcribes it to text, and returns per-segment timestamps — built with engineering judgment as the focus rather than model training.
+A small pipeline that takes an audio file, checks it's actually valid audio, and transcribes it to text with per-segment timestamps. The focus here is the engineering around the transcription (validation, long audio handling, GPU/CPU, failure recovery), not the model itself.
 
-## Overview
+## What's in this repo
 
-Three scripts, each responsible for one stage, with no logic duplicated between them:
-
-| Script | Responsibility |
+| File | Purpose |
 |---|---|
-| [`accept_audio.py`](accept_audio.py) | Validates that a file is genuinely readable audio |
-| [`transcribe.py`](transcribe.py) | Transcribes audio to plain text (also the core engine — chunking, workers, caching all live here) |
-| [`transcribe_with_timestamps.py`](transcribe_with_timestamps.py) | Same pipeline, but returns per-segment `HH:MM:SS` timestamps instead of one flat string |
+| `accept_audio.py` | Checks a file is real, readable audio before anything else touches it |
+| `transcribe.py` | Runs the transcription. Also holds the core logic: chunking, worker management, caching |
+| `transcribe_with_timestamps.py` | Same transcription, formatted as timestamped segments instead of one block of text |
 
-`transcribe.py` and `transcribe_with_timestamps.py` both import `accept_audio()` from `accept_audio.py`. `transcribe_with_timestamps.py` also imports the chunking/worker internals directly from `transcribe.py` rather than reimplementing them — there is exactly one implementation of each piece of logic in this codebase.
+Both transcription scripts share the same underlying function, `transcribe_segments()` in `transcribe.py`. `transcribe.py` just joins its output into plain text, and `transcribe_with_timestamps.py` formats it as `HH:MM:SS` segments. There's one implementation of the actual pipeline, not two copies of it.
 
 ## Setup
 
-**Prerequisites**
-- Python 3.9+
-- [ffmpeg](https://ffmpeg.org/download.html) on `PATH` (provides `ffprobe`, used for validation, silence detection, and chunk splitting)
+You'll need Python 3.9+ and ffmpeg installed and on your PATH (ffprobe specifically, for validation and silence detection).
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Usage
+## Running it
 
 ```bash
 python accept_audio.py audio_files/recording01.m4a
@@ -32,7 +28,8 @@ python transcribe.py audio_files/recording01.m4a
 python transcribe_with_timestamps.py audio_files/recording01.m4a
 ```
 
-`transcribe_with_timestamps.py` outputs JSON:
+`transcribe_with_timestamps.py` prints JSON:
+
 ```json
 {
   "language": "en",
@@ -43,82 +40,82 @@ python transcribe_with_timestamps.py audio_files/recording01.m4a
 }
 ```
 
-Sample audio files for testing are in [`audio_files/`](audio_files/).
+Sample files to try it on are in `audio_files/`.
 
-## Pipeline flow
+## How it works
 
 <img src="assets/pipeline.png" alt="Transcription pipeline flow" width="480">
 
+## Why it's built this way
 
-If any chunk failed, the cache directory is left on disk and a rerun of the same file skips every chunk that already succeeded, retrying only what's missing (see "Resilience" below). On full success, the cache is cleared.
+### Validating audio by content, not by file extension
 
-## Design decisions
+`accept_audio()` doesn't look at the file extension at all. It runs the file through ffprobe and checks what's actually inside it. A missing, empty, or corrupted file gets rejected. A file with no audio stream gets rejected. A video file gets rejected too, even if it happens to have an audio track, since the goal here is an audio-only pipeline.
 
-### `accept_audio.py`: validating by content, not by filename
-
-`accept_audio()` doesn't trust the file extension. It runs the file through `ffprobe` and inspects the actual stream data:
-- No readable stream at all → rejected (covers missing, empty, corrupt, or fake files — e.g. a `.txt` renamed to `.mp3`).
-- Streams present but no audio stream → rejected.
-- Video stream present → rejected, even if an audio track also exists, since the brief asks for an *audio* pipeline.
-
-Because ffprobe/ffmpeg do the actual decoding, any format they support (WAV, MP3, M4A, FLAC, OGG, etc.) works automatically — there's no per-format code to maintain.
+Because ffprobe and ffmpeg do the actual decoding, any format they understand works without extra code on my end. WAV, MP3, M4A, FLAC, whatever ffmpeg supports.
 
 ### Model choice
 
-Both transcription scripts use [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (a CTranslate2-backed reimplementation of Whisper, chosen for speed on CPU) with the `base` checkpoint — a deliberate speed/accuracy tradeoff for a script that needs to run reasonably fast without a GPU. Swapping to a larger checkpoint (e.g. `large-v3`) is a one-line change in `_load_model()` if accuracy matters more than latency in a given context.
+Transcription runs on faster-whisper, using the `base` checkpoint. It's a CTranslate2 port of Whisper, and it's noticeably faster than the original implementation on CPU, which matters since this is meant to run without a GPU as the default case. `base` is a deliberate speed tradeoff. If accuracy mattered more than latency for a given use case, swapping to `large-v3` is a one-line change in `_load_model()`.
 
-`vad_filter=True` is set on every transcription call, so voice-activity detection skips silence during decoding — this both speeds things up and avoids Whisper occasionally hallucinating text over dead air.
+`vad_filter=True` is on for every transcription call. It uses voice activity detection to skip silence, which speeds things up and also avoids Whisper occasionally making up text over dead air.
 
-### Handling long audio
+### Long audio
 
-Whisper's architecture already processes audio in internal, fixed 30-second windows and stitches the result into one continuous transcript — a single `model.transcribe()` call already handles multi-hour files *correctly* with no manual splitting required. Chunking was added on top of that for two different reasons, and it's worth being explicit that they're different:
+Whisper already handles long files on its own. Internally it processes audio in 30 second windows and stitches the output into one transcript, so a two hour recording works fine with a single `model.transcribe()` call. No manual splitting needed to make it correct.
 
-**Speed (CPU only).** Whisper's internal windowing is sequential within one process, so on CPU, splitting a long file into pieces and transcribing them in separate processes at the same time (`multiprocessing.Pool`) genuinely cuts wall-clock time. Worker count is chosen automatically, not hardcoded:
+I still split long files into chunks, but for two separate reasons, and they're not the same reason:
+
+**Speed, on CPU.** Whisper's internal windowing runs sequentially inside one process. If I split a long file into pieces and hand them to several processes at once, that actually cuts down wall clock time. The number of workers isn't a fixed number, it's computed from the machine:
 
 ```python
 auto_cap = max(1, cpu_count() // 2 - 1)
 workers = min(auto_cap, max(1, int(duration // MIN_CHUNK_SECONDS)))
 ```
 
-`cpu_count() // 2` approximates physical core count (hyperthreads share execution units, so they add little for CPU-bound inference like this), and `- 1` leaves a core free for the OS and ffmpeg. The result is also capped so chunks never come out shorter than `MIN_CHUNK_SECONDS` — a very short chunk pays the same fixed model-load cost as a long one, so splitting too finely can make things slower, not faster.
+`cpu_count() // 2` is a rough stand-in for physical core count, since hyperthreads don't help much with CPU-bound work like this. The `-1` leaves one core free so the machine doesn't get pinned. Chunks also never come out shorter than `MIN_CHUNK_SECONDS`, since a tiny chunk pays the same model-loading cost as a big one, so cutting too finely just adds overhead instead of saving time.
 
-**Resilience (CPU and GPU both).** This is the more interesting reason chunking exists, and it applies even when there's no speed benefit at all — see below.
+**Resilience, on both CPU and GPU.** This is the part that matters more, and it holds even when there's no speed benefit at all.
 
-### GPU: same code path, not a separate implementation
+### GPU uses the same code, not a separate path
 
-A CUDA GPU is detected via `ctranslate2.get_cuda_device_count()` (no extra dependency — ctranslate2 already ships with faster-whisper). When one is present, the code does **not** branch into a different implementation. It goes through the exact same `multiprocessing.Pool` call as CPU — just with `workers = 1` instead of many. The reasoning: multiple processes contending for a single GPU, each loading its own full copy of the model into VRAM, is not a way to parallelize; it's just contention. So GPU is treated as "the CPU path with exactly one worker," which is also how it's tested (the checkpointing/retry logic is verified once, under `Pool(1)`, and that test result applies to both CPU-with-one-worker and GPU).
+I check for a CUDA GPU with `ctranslate2.get_cuda_device_count()`, which comes bundled with faster-whisper already. When a GPU is available, I don't branch into different code. It runs through the exact same `multiprocessing.Pool` call as CPU, just with one worker instead of several. The reason: running several processes against one GPU doesn't parallelize anything, it just makes them compete for the same device, and each one would load its own copy of the model into VRAM for no benefit. So GPU is really just "the CPU path with one worker." That's also how I tested it, since I don't have a GPU on hand: I ran the pipeline with the worker count forced to 1 and verified the chunking, caching, and retry logic all behave the same way.
 
-A `Pool` initializer (`_init_worker`) loads the model once per worker process into a module-level global and reuses it for every chunk that worker is given — this matters more on GPU, where model-load cost is the one thing you can't parallelize away, but it benefits CPU too (previously every chunk reloaded the model from scratch, even chunks handled by the same worker).
+There's a `Pool` initializer, `_init_worker()`, that loads the model once per worker process and keeps it around for every chunk that worker handles. That matters a lot on GPU, where loading the model is the one cost you can't parallelize away, and it helps CPU too, since previously every chunk reloaded the model from scratch even when the same worker was handling several chunks in a row.
 
-### Chunk count is deliberately decoupled from worker count
+### Chunk count and worker count are two different numbers
 
-This one is subtle enough to be worth spelling out, because it was a real bug during development: `chunk_length = duration / workers` looks reasonable, but when `workers == 1` (the GPU case, always), it collapses to **one giant chunk covering the entire file** — which throws away all the resilience benefits described below, since there'd be nothing to checkpoint partway through. The fix:
+This tripped me up once while building it, so it's worth calling out directly. My first version computed chunk length as `duration / workers`. That looks fine until workers is 1, which is always true on GPU. At that point it collapses into one giant chunk covering the whole file, which throws away the entire point of chunking for resilience, since there's nothing left to checkpoint partway through.
+
+The fix keeps the two ideas separate:
 
 ```python
 num_chunks = max(workers, int(duration // MIN_CHUNK_SECONDS))
 chunk_length = duration / num_chunks
 ```
 
-Worker count controls *parallelism*. Chunk count controls *checkpoint granularity*. They're related but not the same thing — a single-worker GPU run on a long file still gets many small chunks, processed one after another, purely so there's something to save progress against.
+Worker count decides how much runs in parallel. Chunk count decides how fine-grained the checkpoints are. A GPU run with exactly one worker still gets split into several small chunks, processed one after another, purely so there's something to resume from if it fails partway through.
 
-### Chunk boundaries are snapped to silence, not blind time marks
+### Cutting chunks at silence instead of a fixed time mark
 
-Cutting a file at a blind fixed-time mark risks slicing through the middle of a word or sentence — corrupting that boundary's audio for whichever chunk gets it. Instead, `_find_silence_midpoints` runs ffmpeg's `silencedetect` once over the whole file (a fast pass — no transcription involved) to find real pauses, and `_snap_to_silence` moves each nominal cut point to the nearest pause within `SNAP_SEARCH_SECONDS`. A one-second minimum silence duration (`d=1.0`) is used deliberately — short enough to catch a real pause between sentences, long enough to not catch the half-beat after a comma and risk snapping into the middle of a sentence instead of after it.
+If you just cut a file every N seconds, you'll eventually cut through the middle of a word. `_find_silence_midpoints` runs ffmpeg's `silencedetect` once over the whole file first (fast, no transcription involved) to find actual pauses, and each planned cut point gets nudged to the nearest pause within `SNAP_SEARCH_SECONDS`. I used a one second minimum silence duration for this, long enough to skip past the tiny pause after a comma, short enough to still catch a real gap between sentences.
 
-Because two neighboring chunks both get a little overlap around the boundary (`READ_PAD_SECONDS`) as a safety margin, both chunks can technically "hear" a sentence near the cut. To avoid transcribing it twice, each chunk keeps only the segments whose midpoint falls inside its own `[nominal_start, nominal_end)` window — "midpoint ownership." Whichever chunk's window contains the center of a sentence is the one that keeps it; the other chunk discards it. Getting this right took more than one attempt during development — an earlier version only protected the *start* of each chunk from duplication, not the end, and text could still appear twice near a boundary. The current midpoint-based approach is what actually eliminated that.
+Neighboring chunks overlap slightly at the boundary as a safety margin, which means both chunks can technically hear the same sentence near a cut. To stop that sentence being transcribed twice, each chunk only keeps the segments whose midpoint falls inside its own boundary, whichever chunk's window contains the center of a sentence keeps it, the other one drops it. This took more than one attempt to get right. An earlier version only guarded the start of each chunk against duplication and not the end, and text could still show up twice near a boundary. The midpoint check is what actually fixed that.
 
-### Resilience: fault isolation and resumable caching
+### Recovering from failures
 
-The chunking above exists for speed on CPU, but on GPU (and even CPU with only one available worker) it exists purely for this:
+The chunking described above exists for speed on CPU, but on GPU, and even on CPU when only one worker is available, it exists purely for this.
 
-- **Fault isolation.** Each chunk is retried up to `CHUNK_RETRIES` times. If it still fails, it's marked with an `"error"` field rather than raising — the run continues with the remaining chunks instead of discarding everything. The final transcript comes back with everything that succeeded, plus a clear warning naming exactly which time range is missing and why.
-- **Resumable caching.** Each chunk's successful result is saved to disk as JSON, in a directory keyed off the input file's absolute path, size, and modified time (`_cache_dir_for`) — so re-running the *same* file finds the *same* cache directory. If the whole process dies partway through a long file (crash, OOM, killed process), rerunning it skips every chunk that already succeeded — loaded straight from cache, no re-cutting the audio, no re-running the model — and only retries what's actually missing.
-- **Failures are deliberately never cached.** If a failed result were saved the same way a success is, a rerun would keep loading that same failure forever instead of getting a genuine second attempt. Only successes go to disk; on full success, the cache directory is deleted (nothing is left lying around); on partial failure, it's left in place specifically so the next run can pick up where the last one stopped.
+Each chunk gets retried a couple of times if it fails. If it still doesn't work, it's marked as failed instead of taking down the whole run, so you still get everything that succeeded, along with a warning telling you exactly which time range is missing and why.
 
-### Timestamps across chunk boundaries
+Every chunk that succeeds gets written to disk as JSON, in a folder keyed off the input file's path, size, and modified time. Run the same file again and it lands in the same folder. So if the whole process dies partway through a long file, whether from a crash, running out of memory, or getting killed, rerunning it skips every chunk that already finished and only redoes what's missing.
 
-Each chunk is cut out as its own standalone audio file, so Whisper transcribes it with no idea where in the original recording it came from — segment timestamps always start from 0 relative to that chunk. `_transcribe_chunk` corrects this by adding back `read_start` (the chunk's real start position in the original file) to every segment's start/end before merging, so the final transcript has one continuous, correct timeline even though it was built from separately-transcribed pieces.
+Failed chunks are never written to that cache. If they were, a rerun would just keep loading the same failure forever instead of getting a real second attempt. Only successes get saved. If everything succeeds, the cache folder gets deleted since there's nothing left to resume. If something failed, it stays on disk on purpose, waiting for the next run.
 
-### What's out of scope
+### Keeping timestamps correct across chunks
 
-Speaker diarization, LLM-based transcript cleanup, and running transcription as an async job behind an API (return a job ID immediately, let the caller poll or get a webhook) are all reasonable next steps for a production service, but are outside the scope of this exercise. The async-job point specifically matters once concurrent uploads are involved — see the accompanying system design notes — but isn't needed for a single-request script.
+Each chunk is cut out as its own audio file, so when Whisper transcribes it, it has no idea where that chunk sits in the original recording, its timestamps always start at zero. Before merging results, I add back `read_start`, the chunk's actual position in the original file, to every segment's start and end. That's what keeps the final transcript on one continuous, correct timeline even though it was assembled from pieces transcribed separately.
+
+### What I left out
+
+Speaker diarization, cleaning up the transcript with an LLM, and running this as an async job behind an API are all things I'd add for a real production service, but they're outside what this exercise asked for. The async job piece matters most once you're handling multiple uploads at the same time, which is covered in the system design notes rather than the code here.
